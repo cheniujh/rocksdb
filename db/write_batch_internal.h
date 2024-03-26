@@ -253,6 +253,7 @@ class LocalSavePoint {
  public:
   explicit LocalSavePoint(WriteBatch* batch)
       : batch_(batch),
+        //        连writebatch都能记录savepointer，牛逼，确实，字符串的话记录datasize和count，就能直接撤回修改了，因为rep是append模式追加
         savepoint_(batch->GetDataSize(), batch->Count(),
                    batch->content_flags_.load(std::memory_order_relaxed))
 #ifndef NDEBUG
@@ -263,9 +264,13 @@ class LocalSavePoint {
   }
 
 #ifndef NDEBUG
-  ~LocalSavePoint() { assert(committed_); }
+  ~LocalSavePoint() {
+    //    要确保一定调用了commited方法才正确
+    assert(committed_);
+  }
 #endif
   Status commit() {
+//    这个commit的主要功能就是检查这个writebatch是否有超过内存限制，如果有就返回对应状态，当前操作也会被撤销
 #ifndef NDEBUG
     committed_ = true;
 #endif

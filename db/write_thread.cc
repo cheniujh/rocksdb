@@ -211,11 +211,15 @@ uint8_t WriteThread::AwaitState(Writer* w, uint8_t goal_mask,
 
 void WriteThread::SetState(Writer* w, uint8_t new_state) {
   assert(w);
+  /*这一段和awaitstate函数相互呼应*/
   auto state = w->state.load(std::memory_order_acquire);
   if (state == STATE_LOCKED_WAITING ||
-      !w->state.compare_exchange_strong(state, new_state)) {
+      !w->state.compare_exchange_strong(
+          state,
+          new_state)) { /*会先用exchange去更新状态，strong和weak的行为模式比较接近，但是strong失败的概率更低*/
     assert(state == STATE_LOCKED_WAITING);
 
+    /*如果连strong都失败了，只能直接用cv了*/
     std::lock_guard<std::mutex> guard(w->StateMutex());
     assert(w->state.load(std::memory_order_relaxed) != new_state);
     w->state.store(new_state, std::memory_order_relaxed);
@@ -233,6 +237,8 @@ bool WriteThread::LinkOne(Writer* w, std::atomic<Writer*>* newest_writer) {
     // block here until stall is cleared. If its true, then return
     // immediately
     if (writers == &write_stall_dummy_) {
+      /*查看一下是否 需要stall，也就是检查队尾那个节点是不是write_stall_dummy_
+       */
       if (w->no_slowdown) {
         w->status = Status::Incomplete("Write stall");
         SetState(w, STATE_COMPLETED);
@@ -244,6 +250,8 @@ bool WriteThread::LinkOne(Writer* w, std::atomic<Writer*>* newest_writer) {
         MutexLock lock(&stall_mu_);
         writers = newest_writer->load(std::memory_order_relaxed);
         if (writers == &write_stall_dummy_) {
+          /*再确定一下队尾是不是dummy，如果是就wait*/
+
           TEST_SYNC_POINT_CALLBACK("WriteThread::WriteStall::Wait", w);
           stall_cv_.Wait();
           // Load newest_writers_ again since it may have changed
@@ -252,8 +260,12 @@ bool WriteThread::LinkOne(Writer* w, std::atomic<Writer*>* newest_writer) {
         }
       }
     }
+    /*这里比较清晰，插入队头*/
     w->link_older = writers;
+    /*这里用weak而不用strong主要是为了避免高竞争，有时候哪怕newest_writer想等于writers，也会更新失败*/
+    /*如果更新失败了，这里就会进入while再来，另外writers会被更新为newst_writer的最新值*/
     if (newest_writer->compare_exchange_weak(writers, w)) {
+      /*newest_writer其实是队列末尾！，这里是往队列末尾追加啊*/
       return (writers == nullptr);
     }
   }
@@ -402,8 +414,10 @@ void WriteThread::JoinBatchGroup(Writer* w) {
   TEST_SYNC_POINT_CALLBACK("WriteThread::JoinBatchGroup:Start", w);
   assert(w->batch != nullptr);
 
+  /*这里似乎是将writer加入到list上，如果之前队列是空的，那自己就是新leader*/
   bool linked_as_leader = LinkOne(w, &newest_writer_);
 
+  /*  如果队列里只有w，而且w是队头*/
   if (linked_as_leader) {
     SetState(w, STATE_GROUP_LEADER);
   }
@@ -412,20 +426,21 @@ void WriteThread::JoinBatchGroup(Writer* w) {
   TEST_SYNC_POINT_CALLBACK("WriteThread::JoinBatchGroup:Wait2", w);
 
   if (!linked_as_leader) {
+    /*加入进去了队尾，如果自己不是leader，就需要等一等，等leader给点指令（通过mask)*/
+    /*2.1说明还是会打包batch写入memtable的*/
     /**
      * Wait util:
      * 1) An existing leader pick us as the new leader when it finishes
-     * 2) An existing leader pick us as its follewer and
-     * 2.1) finishes the memtable writes on our behalf
-     * 2.2) Or tell us to finish the memtable writes in pralallel
-     * 3) (pipelined write) An existing leader pick us as its follower and
-     *    finish book-keeping and WAL write for us, enqueue us as pending
-     *    memtable writer, and
-     * 3.1) we become memtable writer group leader, or
-     * 3.2) an existing memtable writer group leader tell us to finish memtable
-     *      writes in parallel.
+     * (检查一下exit，看是否有选择新leader的行为 2) An existing leader pick us
+     * as its follewer and 2.1) finishes the memtable writes on our behalf 2.2)
+     * Or tell us to finish the memtable writes in pralallel 3) (pipelined
+     * write) An existing leader pick us as its follower and finish book-keeping
+     * and WAL write for us, enqueue us as pending memtable writer, and 3.1) we
+     * become memtable writer group leader, or 3.2) an existing memtable writer
+     * group leader tell us to finish memtable writes in parallel.
      */
     TEST_SYNC_POINT_CALLBACK("WriteThread::JoinBatchGroup:BeganWaiting", w);
+    /*这里面的等待策略还挺复杂的，最开始是用cpu的pause指令200次，每次7ns。如果还不行，就std::this_thread::yield()把cpu让出去，如果还不行就用互斥量了*/
     AwaitState(w,
                STATE_GROUP_LEADER | STATE_MEMTABLE_WRITER_LEADER |
                    STATE_PARALLEL_MEMTABLE_WRITER | STATE_COMPLETED,
@@ -434,14 +449,22 @@ void WriteThread::JoinBatchGroup(Writer* w) {
   }
 }
 
-size_t WriteThread::EnterAsBatchGroupLeader(Writer* leader,
-                                            WriteGroup* write_group) {
+size_t WriteThread::EnterAsBatchGroupLeader(
+    Writer* leader,
+    WriteGroup*
+        write_group) { /*
+                        * 这个函数先从leader往前迭代所有writers，分出一个r_list存储不能合并的writers，然后原链表内部都是可以合并的writers,用writer_group的last_writer指过去那个end，然后writer_group自己又存储了leader指针，所以writer_group等于拿到了这个可以合并的writers链表的头尾指针
+                        * 再然后会让r_list的头链接上这个被加入writer_group的尾上，然后再把r_list的尾巴赋值给newest_writer指针（如果发现其他线程对newest_writer进行了append，就需要迭代一下找到其最后一个链接，把r_list链接上去（这个r_list属于是插队进去，回到原来的位置上，而不是append到新writers的末尾
+                        * 总之这里结束后，有了一个writer_group（尽管这些节点还挂在writeThead的链表上）
+                        */
+  /*检查确认leader前面没有别的节点了*/
   assert(leader->link_older == nullptr);
   assert(leader->batch != nullptr);
   assert(write_group != nullptr);
 
   size_t size = WriteBatchInternal::ByteSize(leader->batch);
 
+  /*这里似乎又开始合并多个writebatch了*/
   // Allow the group to grow up to a maximum size, but if the
   // original write is small, limit the growth so we do not slow
   // down the small write too much.
@@ -455,6 +478,7 @@ size_t WriteThread::EnterAsBatchGroupLeader(Writer* leader,
   write_group->leader = leader;
   write_group->last_writer = leader;
   write_group->size = 1;
+  /*这里是取了队列尾巴*/
   Writer* newest_writer = newest_writer_.load(std::memory_order_acquire);
 
   // This is safe regardless of any db mutex status of the caller. Previous
@@ -462,6 +486,7 @@ size_t WriteThread::EnterAsBatchGroupLeader(Writer* leader,
   // (they emptied the list and then we added ourself as leader) or had to
   // explicitly wake us up (the list was non-empty when we added ourself,
   // so we have already received our MarkJoined).
+  /*这个batch本来是个双向链表，但是可能目前位置只有单向指针赋值了（link_older有值，但是LinkNewer没有值，所以能从队尾巴迭代去leader，但是leader那里没法向前回溯)*/
   CreateMissingNewerLinks(newest_writer);
 
   // This comment illustrates how the rest of the function works using an
@@ -500,8 +525,12 @@ size_t WriteThread::EnterAsBatchGroupLeader(Writer* leader,
   Writer* rb = nullptr;
   Writer* re = nullptr;
 
-  while (w != newest_writer) {
+  while (
+      w !=
+      newest_writer) { /*一路从leader的前一个节点开始，迭代到尾巴上去,注意，newest_writer本身也会被处理
+                        */
     assert(w->link_newer);
+
     w = w->link_newer;
 
     if ((w->sync && !leader->sync) ||
@@ -523,22 +552,29 @@ size_t WriteThread::EnterAsBatchGroupLeader(Writer* leader,
         (size + WriteBatchInternal::ByteSize(w->batch) > max_size)
         // Do not make batch too big
     ) {
+      /*这个分支是踢出一些不能合并的writers，假如leader不是sync，那么sync的writer就得拿走*/
       // remove from list
-      w->link_older->link_newer = w->link_newer;
-      if (w->link_newer != nullptr) {
+      w->link_older->link_newer =
+          w->link_newer; /*将自己从链表中移出，并且建立前后节点的第一个链接*/
+      if (w->link_newer !=
+          nullptr) { /*如果自己前面节点不是null，则把第二个链接补齐*/
         w->link_newer->link_older = w->link_older;
       }
       // insert into r_list
       if (re == nullptr) {
+        /*如果r_list是空，则加入，自己也是队头*/
         rb = re = w;
         w->link_older = nullptr;
       } else {
+        /*如果r_list非空，从rend进行append，这里创建了双向的链接*/
         w->link_older = re;
         re->link_newer = w;
         re = w;
       }
     } else {
       // grow up
+      /*如果当前writerbatch能合并，也就是把当前writer挂为lastwriter，这里无需连接link，因为w本身就有link*/
+      /*整个过程可以理解为，只是write_group的一枚last_writer指针在移动，不断指向最新的已迭代到的合法位置，对于链表本身，它只是会时不时将无法合并的writer丢到r_list里面*/
       we = w;
       w->write_group = write_group;
       size += WriteBatchInternal::ByteSize(w->batch);
@@ -546,12 +582,23 @@ size_t WriteThread::EnterAsBatchGroupLeader(Writer* leader,
       write_group->size++;
     }
   }
+  /*这里结束了while，已经分出了write_group和r_list*/
+  /* 如果排除并发，此时w就是newest_writer，并且它自己也被整合进了writergroup或者r_list中*/
   // append r_list after write_group end
+  /*这个r_list并没有append到writer_group上，它只是让r_list的end后面接上了write_group的头结点*/
+  /* write_group的last_writer没有修改，这里实际上是把没法合并的writers还到writers链表里了*/
   if (rb != nullptr) {
     rb->link_older = we;
     re->link_newer = nullptr;
     we->link_newer = rb;
-    if (!newest_writer_.compare_exchange_weak(w, re)) {
+    /* 这里是另外一个更新newest_writer的地方了，同样也是exchange_weak */
+    /*w本身也是被处理了（在r_list或者write_group中),此时newest_writer其实指向w是不准确的，所以需要更新*/
+    if (!newest_writer_.compare_exchange_weak(
+            w,
+            re)) { /*这里将整个r_list
+                      append到writers链表上面了，另外整个r_list尾巴上其实还连接这writer_goup的writers*/
+      /* 此时有一种情况就是别的线程做了joinbatchgroup,newest_writer发生了更新，此时writers链表的link_older指向了之前的newest_writer，也就是w的旧值，而这个节点实际上已经发生了重排，在r_list或者writergroup里面，这个link_older是错误的，所以需要找到这个链接，并且修改它为r_list
+       * end，这样才不会丢失writers*/
       while (w->link_older != newest_writer) {
         w = w->link_older;
       }
@@ -668,18 +715,22 @@ static WriteThread::AdaptationContext cpmtw_ctx(
     "CompleteParallelMemTableWriter");
 // This method is called by both the leader and parallel followers
 bool WriteThread::CompleteParallelMemTableWriter(Writer* w) {
+  /*本来在奇怪，为什么会有writegroup，现在想着可能是leader处理的时候确实给了它赋值了，或者说，能并发执行的w，自己首先得要在
+   * group里面*/
   auto* write_group = w->write_group;
   if (!w->status.ok()) {
     std::lock_guard<std::mutex> guard(write_group->leader->StateMutex());
     write_group->status = w->status;
   }
 
-  if (write_group->running-- > 1) {
+  if (write_group->running-- >
+      1) { /*这里确定了，这个能并发的w，一定是writegroup的一员*/
     // we're not the last one
     AwaitState(w, STATE_COMPLETED, &cpmtw_ctx);
     return false;
   }
   // else we're the last parallel worker and should perform exit duties.
+  /*这里的state应该也是state_completed*/
   w->status = write_group->status;
   // Callers of this function must ensure w->status is checked.
   write_group->status.PermitUncheckedError();
@@ -792,9 +843,26 @@ void WriteThread::ExitAsBatchGroupLeader(WriteGroup& write_group,
                    STATE_COMPLETED,
                &eabgl_ctx);
   } else {
+    /*这里是非pipeline的热路径*/
+    /*取出队列尾巴*/
     Writer* head = newest_writer_.load(std::memory_order_acquire);
-    if (head != last_writer ||
-        !newest_writer_.compare_exchange_strong(head, nullptr)) {
+    if (head !=
+            last_writer || /*为true说明在write_group的消费期间有新的writer发生append，或者干脆就是之前有rlist*/
+        !newest_writer_.compare_exchange_strong(
+            head, nullptr)) { /*只有head == last_writer才会触发这个函数*/
+      /*有一种情况会直接不进这个分支，就是：head ==
+       * last_writer(没有新writer到达) 并且
+       * 通过exchange_strong，直接把writer_group从链表上直接摘下来了，也就是链表直接为空了*/
+      /*
+       * 有两种情况会进来
+       * 1 head!=last_writer(writer_group消费期间进入了新writer)
+       * 2
+       * head等于last_writer(没有新writer到达),但是切断行为失败了，说明在这期间加入了新writer
+       *
+       * 这两种情况都是队列中有了新writer到达，队列中不止有writeGroup
+       * 这两种情况都会进来这里面，对链表进行截断，并设置新leader
+       *
+       */
       // Either last_writer wasn't the head during the load(), or it was the
       // head during the load() but somebody else pushed onto the list before
       // we did the compare_exchange_strong (causing it to fail).  In the
@@ -811,19 +879,23 @@ void WriteThread::ExitAsBatchGroupLeader(WriteGroup& write_group,
       // could cause the next leader to start their work without a call
       // to MarkJoined, so we can definitely conclude that no other leader
       // work is going on here (with or without db mutex).
+      /*有些刚刚加入的节点只有link_older的单向链接(老节点没有指向他们)，这里补全一下链接，确保他是双向链表*/
       CreateMissingNewerLinks(head);
       assert(last_writer->link_newer != nullptr);
       assert(last_writer->link_newer->link_older == last_writer);
+      /*这一步非常关键，把write_gruop从队列里切割出来了*/
       last_writer->link_newer->link_older = nullptr;
 
       // Next leader didn't self-identify, because newest_writer_ wasn't
       // nullptr when they enqueued (we were definitely enqueued before them
       // and are still in the list).  That means leader handoff occurs when
       // we call MarkJoined
+      /*标记一个新的leader，leader似乎除了这里，还有就是joinBatchGroup的地方可以指定（如果w是唯一一个节点）*/
       SetState(last_writer->link_newer, STATE_GROUP_LEADER);
     }
     // else nobody else was waiting, although there might already be a new
     // leader now
+    /*说的非常对，此时可能会有两个leader哦*/
 
     while (last_writer != leader) {
       assert(last_writer);
@@ -831,9 +903,9 @@ void WriteThread::ExitAsBatchGroupLeader(WriteGroup& write_group,
       // we need to read link_older before calling SetState, because as soon
       // as it is marked committed the other thread's Await may return and
       // deallocate the Writer.
+      /*从后往前设置完成状态*/
       auto next = last_writer->link_older;
       SetState(last_writer, STATE_COMPLETED);
-
       last_writer = next;
     }
   }

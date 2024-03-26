@@ -21,7 +21,7 @@ class TraceWriter {
  public:
   virtual ~TraceWriter() = default;
 
-  virtual Status Write(const Slice& data) = 0;
+  virtual Status  Write(const Slice& data) = 0;
   virtual Status Close() = 0;
   virtual uint64_t GetFileSize() = 0;
 };

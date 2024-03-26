@@ -7,34 +7,37 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// WriteBatch::rep_ :=
-//    sequence: fixed64
-//    count: fixed32
-//    data: record[count]
-// record :=
-//    kTypeValue varstring varstring
-//    kTypeDeletion varstring
-//    kTypeSingleDeletion varstring
-//    kTypeRangeDeletion varstring varstring
-//    kTypeMerge varstring varstring
-//    kTypeColumnFamilyValue varint32 varstring varstring
-//    kTypeColumnFamilyDeletion varint32 varstring
-//    kTypeColumnFamilySingleDeletion varint32 varstring
-//    kTypeColumnFamilyRangeDeletion varint32 varstring varstring
-//    kTypeColumnFamilyMerge varint32 varstring varstring
-//    kTypeBeginPrepareXID
-//    kTypeEndPrepareXID varstring
-//    kTypeCommitXID varstring
-//    kTypeCommitXIDAndTimestamp varstring varstring
-//    kTypeRollbackXID varstring
-//    kTypeBeginPersistedPrepareXID
-//    kTypeBeginUnprepareXID
-//    kTypeWideColumnEntity varstring varstring
-//    kTypeColumnFamilyWideColumnEntity varint32 varstring varstring
-//    kTypeNoop
-// varstring :=
-//    len: varint32
-//    data: uint8[len]
+
+// rep是WriteBatch的实体，所以实际上就是个string
+
+//  WriteBatch::rep_ :=
+//     sequence: fixed64
+//     count: fixed32
+//     data: record[count]
+//  record :=
+//     kTypeValue varstring varstring
+//     kTypeDeletion varstring
+//     kTypeSingleDeletion varstring
+//     kTypeRangeDeletion varstring varstring
+//     kTypeMerge varstring varstring
+//     kTypeColumnFamilyValue varint32 varstring varstring
+//     kTypeColumnFamilyDeletion varint32 varstring
+//     kTypeColumnFamilySingleDeletion varint32 varstring
+//     kTypeColumnFamilyRangeDeletion varint32 varstring varstring
+//     kTypeColumnFamilyMerge varint32 varstring varstring
+//     kTypeBeginPrepareXID
+//     kTypeEndPrepareXID varstring
+//     kTypeCommitXID varstring
+//     kTypeCommitXIDAndTimestamp varstring varstring
+//     kTypeRollbackXID varstring
+//     kTypeBeginPersistedPrepareXID
+//     kTypeBeginUnprepareXID
+//     kTypeWideColumnEntity varstring varstring
+//     kTypeColumnFamilyWideColumnEntity varint32 varstring varstring
+//     kTypeNoop
+//  varstring :=
+//     len: varint32
+//     data: uint8[len]
 
 #include "rocksdb/write_batch.h"
 
@@ -513,6 +516,7 @@ Status WriteBatchInternal::Iterate(const WriteBatch* wb,
     return Status::Corruption("Invalid start/end bounds for Iterate");
   }
   assert(begin <= end);
+  /*rep转成了slice*/
   Slice input(wb->rep_.data() + begin, static_cast<size_t>(end - begin));
   bool whole_batch =
       (begin == WriteBatchInternal::kHeader) && (end == wb->rep_.size());
@@ -541,7 +545,7 @@ Status WriteBatchInternal::Iterate(const WriteBatch* wb,
       last_was_try_again = false;
       tag = 0;
       column_family = 0;  // default
-
+      /*取出一对key，value，以及这个操作的类型（tage),时间戳等，并且后移slice的指针*/
       s = ReadRecordFromWriteBatch(&input, &tag, &column_family, &key, &value,
                                    &blob, &xid, &write_unix_time);
       if (!s.ok()) {
@@ -564,6 +568,7 @@ Status WriteBatchInternal::Iterate(const WriteBatch* wb,
       case kTypeValue:
         assert(wb->content_flags_.load(std::memory_order_relaxed) &
                (ContentFlags::DEFERRED | ContentFlags::HAS_PUT));
+        /*这里似乎就是一个一个keyvalue插入到memtble的*/
         s = handler->PutCF(column_family, key, value);
         if (LIKELY(s.ok())) {
           empty_batch = false;
@@ -838,12 +843,16 @@ Status WriteBatchInternal::Put(WriteBatch* b, uint32_t column_family_id,
   LocalSavePoint save(b);
   WriteBatchInternal::SetCount(b, WriteBatchInternal::Count(b) + 1);
   if (column_family_id == 0) {
+    //    如果使用默认的column family，直接ktypevalue，然后接userkey
     b->rep_.push_back(static_cast<char>(kTypeValue));
   } else {
+    //    如果使用了非默认的column family，就keytypeColumnfamily，然后塞入cf
+    //    id，再接userkey
     b->rep_.push_back(static_cast<char>(kTypeColumnFamilyValue));
     PutVarint32(&b->rep_, column_family_id);
   }
   PutLengthPrefixedSlice(&b->rep_, key);
+  //  为啥直接塞入value呢
   PutLengthPrefixedSlice(&b->rep_, value);
   b->content_flags_.store(
       b->content_flags_.load(std::memory_order_relaxed) | ContentFlags::HAS_PUT,
@@ -914,12 +923,13 @@ Status WriteBatch::Put(ColumnFamilyHandle* column_family, const Slice& key,
   std::tie(s, cf_id, ts_sz) =
       WriteBatchInternal::GetColumnFamilyIdAndTimestampSize(this,
                                                             column_family);
-
+  //  拿到column family id，以及该column  family的timestap size
   if (!s.ok()) {
     return s;
   }
 
   if (0 == ts_sz) {
+    //    没有时间戳，直接走这个传统流程，穿进去了cfid+key
     return WriteBatchInternal::Put(this, cf_id, key, value);
   }
 
@@ -2126,7 +2136,9 @@ class MemTableInserter : public WriteBatch::Handler {
     }
 
     Status ret_status;
+    /*这个Seek会让current_指向目标cf，后面直接getMemtable就能拿到目标*/
     if (UNLIKELY(!SeekToColumnFamily(column_family_id, &ret_status))) {
+      /*如果没有找到目标cf*/
       if (ret_status.ok() && rebuilding_trx_ != nullptr) {
         assert(!write_after_commit_);
         // The CF is probably flushed and hence no need for insert but we still
@@ -2143,13 +2155,15 @@ class MemTableInserter : public WriteBatch::Handler {
       return ret_status;
     }
     assert(ret_status.ok());
-
+    /*这里会直接拿到属于对应cf的mem，因为前面进行过seek*/
     MemTable* mem = cf_mems_->GetMemTable();
     auto* moptions = mem->GetImmutableMemTableOptions();
     // inplace_update_support is inconsistent with snapshots, and therefore with
     // any kind of transactions including the ones that use seq_per_batch
     assert(!seq_per_batch_ || !moptions->inplace_update_support);
+    /*原地更新说的是直接在memtable里更新userkey的值，也就是会直接丢掉一些旧版本的userkey*/
     if (!moptions->inplace_update_support) {
+      /*这里才是热分支，追加更新*/
       ret_status =
           mem->Add(sequence_, value_type, key, value, kv_prot_info,
                    concurrent_memtable_writes_, get_post_process_info(mem),
@@ -3105,15 +3119,18 @@ Status WriteBatchInternal::InsertInto(
   (void)batch_cnt;
 #endif
   assert(writer->ShouldWriteToMemtable());
+  /*这个inserter现在构造的时候没有传writerbatch，它只是和memtables关联了起来*/
   MemTableInserter inserter(sequence, memtables, flush_scheduler,
                             trim_history_scheduler,
                             ignore_missing_column_families, log_number, db,
                             concurrent_memtable_writes, nullptr /* prot_info */,
                             nullptr /*has_valid_writes*/, seq_per_batch,
                             batch_per_txn, hint_per_batch);
+  /*在这给setseqnum，是否说明前面没有实质性插入行为，只是构造*/
   SetSequence(writer->batch, sequence);
   inserter.set_log_number_ref(writer->log_ref);
   inserter.set_prot_info(writer->batch->prot_info_.get());
+  /*这里应该就是真正的插入行为了，会迭代内部每一个entry，然后插入mem*/
   Status s = writer->batch->Iterate(&inserter);
   assert(!seq_per_batch || batch_cnt != 0);
   assert(!seq_per_batch || inserter.sequence() - sequence == batch_cnt);
@@ -3281,6 +3298,7 @@ Status WriteBatchInternal::Append(WriteBatch* dst, const WriteBatch* src,
     // be appende to write batch with empty prot_info
     dst->prot_info_ = nullptr;
   }
+  /*  batch的追加实际上就是string的append，rep就是string*/
   SetCount(dst, Count(dst) + src_count);
   assert(src->rep_.size() >= WriteBatchInternal::kHeader);
   dst->rep_.append(src->rep_.data() + WriteBatchInternal::kHeader, src_len);

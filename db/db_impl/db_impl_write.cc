@@ -226,8 +226,14 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
         "WriteOptions::disableWAL option is not supported if "
         "DBOptions::recycle_log_file_num > 0");
   }
+
+  /*
+   * 上面都是参数检查
+   */
+
   // TODO: this use of operator bool on `tracer_` can avoid unnecessary lock
   // grabs but does not seem thread-safe.
+  /*tracer_主要用于性能统计和追踪，默认不开启*/
   if (tracer_) {
     InstrumentedMutexLock lock(&trace_mutex_);
     if (tracer_ && !tracer_->IsWriteOrderPreserved()) {
@@ -238,9 +244,11 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
       tracer_->Write(my_batch).PermitUncheckedError();
     }
   }
+
   if (write_options.sync && write_options.disableWAL) {
     return Status::InvalidArgument("Sync writes has to enable WAL.");
   }
+  /*这里好像说可以有多个write queue*/
   if (two_write_queues_ && immutable_db_options_.enable_pipelined_write) {
     return Status::NotSupported(
         "pipelined_writes is not compatible with concurrent prepares");
@@ -248,6 +256,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   if (seq_per_batch_ && immutable_db_options_.enable_pipelined_write) {
     // TODO(yiwu): update pipeline write with seq_per_batch and batch_cnt
     return Status::NotSupported(
+
         "pipelined_writes is not compatible with seq_per_batch");
   }
   if (immutable_db_options_.unordered_write &&
@@ -268,6 +277,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   assert(!WriteBatchInternal::IsLatestPersistentState(my_batch) ||
          disable_memtable);
 
+  /*如果写入是低优先级的，就限流，也就是暂缓执行*/
   if (write_options.low_pri) {
     Status s = ThrottleLowPriWritesIfNeeded(write_options, my_batch);
     if (!s.ok()) {
@@ -275,17 +285,20 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
     }
   }
 
+  /*禁了memtable，并且wal用单独的队列，就直接写wal了*/
   if (two_write_queues_ && disable_memtable) {
     AssignOrder assign_order =
         seq_per_batch_ ? kDoAssignOrder : kDontAssignOrder;
     // Otherwise it is WAL-only Prepare batches in WriteCommitted policy and
     // they don't consume sequence.
+    /*所谓的第二个write_queue,就是这个nonmem_write_thread_*/
     return WriteImplWALOnly(&nonmem_write_thread_, write_options, my_batch,
                             callback, log_used, log_ref, seq_used, batch_cnt,
                             pre_release_callback, assign_order,
                             kDontPublishLastSeq, disable_memtable);
   }
 
+  /*如果是unordered_write，進入這個分支，写完直接走了*/
   if (immutable_db_options_.unordered_write) {
     const size_t sub_batch_cnt = batch_cnt != 0
                                      ? batch_cnt
@@ -294,6 +307,11 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
     uint64_t seq = 0;
     // Use a write thread to i) optimize for WAL write, ii) publish last
     // sequence in in increasing order, iii) call pre_release_callback serially
+    /*这里先写wal，不过没搞懂write thread是在哪里跑起来的
+     * 解答:write_thread不创建线程，只维护队列，多线程都是用户线程
+     * */
+    /*这里在wal走了队列，写完成以后，就去下面写memtable*/
+    /*这个wal内部写入还是有序的，因为走了队列*/
     Status status = WriteImplWALOnly(
         &write_thread_, write_options, my_batch, callback, log_used, log_ref,
         &seq, sub_batch_cnt, pre_release_callback, kDoAssignOrder,
@@ -305,8 +323,10 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
     if (seq_used) {
       *seq_used = seq;
     }
+    /*要先写了WAL才来写mem*/
     if (!disable_memtable) {
       TEST_SYNC_POINT("DBImpl::WriteImpl:BeforeUnorderedWriteMemtable");
+      /*这里之所以叫unordered，应该就是因为没有走队列，说的是w之间无序，之所以会无序，因为有些w会先返回(尽管前面写wal是按照顺序，但是由于时间片的缘故，可能就是会先返回)*/
       status = UnorderedWriteMemtable(write_options, my_batch, callback,
                                       log_ref, seq, sub_batch_cnt);
     }
@@ -314,26 +334,38 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   }
 
   if (immutable_db_options_.enable_pipelined_write) {
+    /*回头好好看看这个Pipeline是什么机制*/
     return PipelinedWriteImpl(write_options, my_batch, callback, log_used,
                               log_ref, disable_memtable, seq_used);
   }
 
   PERF_TIMER_GUARD(write_pre_and_post_process_time);
+  /*到了这里，说明就是ordered_write了，按道理是需要队列的了，因为要有序*/
   WriteThread::Writer w(write_options, my_batch, callback, log_ref,
+
                         disable_memtable, batch_cnt, pre_release_callback,
                         post_memtable_callback);
   StopWatch write_sw(immutable_db_options_.clock, stats_, DB_WRITE);
 
-  write_thread_.JoinBatchGroup(&w);
+  /*这里也是加入writers队列，现在有点搞不清的是整个write_thread_了*/
+  /*gpt说writeThread本身不创建thread，只是用来维护writers队列的而已*/
+  write_thread_.JoinBatchGroup(&w); /*这里是老样子，从newest_writer加入队尾*/
+  /* 在JoinBatchGroup里面如果作为非leader加入，等一会收到了目标mask(STATE_PARALLEL_MEMTABLE_WRITER等)后就会返回*/
   if (w.state == WriteThread::STATE_PARALLEL_MEMTABLE_WRITER) {
+    /*在JoinBatchGroup中给的状态，要求做并行的memtable写入
+     * 这里的并行实际上就是applicationthread！*/
+    /* 此时这个w一定是leader构造好的writegroup中的一员，因为并发状态只能由leader告知
+     * 猜测: wal部分在后面leader处理，毕竟wal应当按序不能并发
+     * */
+    /*如果不走这里，就是下面leader按需合并写入了memtable*/
     // we are a non-leader in a parallel group
-
     if (w.ShouldWriteToMemtable()) {
       PERF_TIMER_STOP(write_pre_and_post_process_time);
       PERF_TIMER_FOR_WAIT_GUARD(write_memtable_time);
 
       ColumnFamilyMemTablesImpl column_family_memtables(
           versions_->GetColumnFamilySet());
+      /*这里单纯就是只写它自己这个writeBatch，不进行打包*/
       w.status = WriteBatchInternal::InsertInto(
           &w, w.sequence, &column_family_memtables, &flush_scheduler_,
           &trim_history_scheduler_,
@@ -343,8 +375,9 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
 
       PERF_TIMER_START(write_pre_and_post_process_time);
     }
-
+    /*w->state确实是在里面改成了completed*/
     if (write_thread_.CompleteParallelMemTableWriter(&w)) {
+      /*如果它不是true，说明不是group内最后一个writer，会等待为state_completed并且返回false，如果它是，则要做write_group的收尾工作，有额外职责*/
       // we're responsible for exit batch group
       // TODO(myabandeh): propagate status to write_group
       auto last_sequence = w.write_group->last_sequence;
@@ -360,11 +393,13 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
       }
       versions_->SetLastSequence(last_sequence);
       MemTableInsertStatusCheck(w.status);
+      /*收尾的重点在这里，主要是进去调了一下ExitAsBatchGroupLeader,并且把leader的状态也改为state_completed*/
       write_thread_.ExitAsBatchGroupFollower(&w);
     }
     assert(w.state == WriteThread::STATE_COMPLETED);
     // STATE_COMPLETED conditional below handles exit
   }
+  /*这里要么被leader打包消费了，要么就是上个分支自己并发写了*/
   if (w.state == WriteThread::STATE_COMPLETED) {
     if (log_used != nullptr) {
       *log_used = w.log_used;
@@ -373,10 +408,16 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
       *seq_used = w.sequence;
     }
     // write is complete and leader has updated sequence
+    /*对于follower在这里就返回了*/
+    /*
+     * 总的来说，作为follower，进来会先joinWriteGroup,然后wait，直到它自己被处理完毕或者leader叫他parallel
+     * write
+     * 如果发生的是并发写，最后一个完成的w需要负责收尾工作，调用ExitAsBatchGroupFollower,进去会调用ExitAs..Leader,负责将writerGroup从队列上摘除
+     */
     return w.FinalStatus();
   }
   // else we are the leader of the write batch group
-  assert(w.state == WriteThread::STATE_GROUP_LEADER);
+  assert(w.state == WriteThread::STATE_GROUP_LEADER);as
   Status status;
   // Once reaches this point, the current writer "w" will try to do its write
   // job.  It may also pick up some of the remaining writers in the "writers_"
@@ -388,6 +429,10 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   bool in_parallel_group = false;
   uint64_t last_sequence = kMaxSequenceNumber;
 
+  /*到了这个地方一定不能有 双队列，并且一定要开启了memtable*/
+  /*目前我知道的唯一一个writer队列就是在writethread_成员上*/
+  /* 后者是因为如果不写memtable在前面就结束返回了，前者是为啥？ */
+  /*解答：因为第二个队列nonmem_write_thread只能写非memtable，并且并发情况下只能单queue*/
   assert(!two_write_queues_ || !disable_memtable);
   {
     // With concurrent writes we do preprocess only in the write thread that
@@ -396,7 +441,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
 
     // PreprocessWrite does its own perf timing.
     PERF_TIMER_STOP(write_pre_and_post_process_time);
-
+    /*这里就是leveldb中的makeRoomForWrite*/
     status = PreprocessWrite(write_options, &log_context, &write_context);
     if (!two_write_queues_) {
       // Assign it after ::PreprocessWrite since the sequence might advance
@@ -413,6 +458,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   // into memtables
 
   TEST_SYNC_POINT("DBImpl::WriteImpl:BeforeLeaderEnters");
+  /*进去这里主要是从队列里构造write_group*/
   last_batch_group_size_ =
       write_thread_.EnterAsBatchGroupLeader(&w, &write_group);
 
@@ -430,6 +476,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
     // assumed to be true.  Rule 3 is checked for each batch.  We could
     // relax rules 2 if we could prevent write batches from referring
     // more than once to a particular key.
+    /*两种情况不能并发写mem：1 这个put是inplace_update,  2 merges不行*/
     bool parallel = immutable_db_options_.allow_concurrent_memtable_write &&
                     write_group.size > 1;
     size_t total_count = 0;
@@ -471,9 +518,12 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
     // disalbe_memtable in between; although we do not write this batch to
     // memtable it still consumes a seq. Otherwise, if !seq_per_batch_, we inc
     // the seq per valid written key to mem.
+    /*这里长见识了，原来可以每个entry一个seq，也可以每个batch一个seq*/
     size_t seq_inc = seq_per_batch_ ? valid_batches : total_count;
 
-    const bool concurrent_update = two_write_queues_;
+    const bool concurrent_update =
+        two_write_queues_; /*？？？ 1 会到这里来，这个玩意
+                              应该就是false吧，前面都assert了*/
     // Update stats while we are an exclusive group leader, so we know
     // that nobody else can be writing to these particular stats.
     // We're optimistic, updating the stats before we successfully
@@ -499,21 +549,26 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
     if (write_options.disableWAL) {
       has_unpersisted_data_.store(true, std::memory_order_relaxed);
     }
+    /*上面都是统计*/
 
     PERF_TIMER_STOP(write_pre_and_post_process_time);
-
+    /*明确一点：这里往下的都是leader writers在走*/
+    /*这里先写WAL*/
     if (!two_write_queues_) {
       if (status.ok() && !write_options.disableWAL) {
         assert(log_context.log_file_number_size);
         LogFileNumberSize& log_file_number_size =
             *(log_context.log_file_number_size);
         PERF_TIMER_GUARD(write_wal_time);
+        /*里面会遍历writeGroup，攒一个mergebatch，然后一起写wal*/
         io_s =
             WriteToWAL(write_group, log_context.writer, log_used,
                        log_context.need_log_sync, log_context.need_log_dir_sync,
                        last_sequence + 1, log_file_number_size);
       }
     } else {
+      /*？？？？ 为什么这里会还有two_write_queues为true？
+       * 前面那个assert算怎么回事*/
       if (status.ok() && !write_options.disableWAL) {
         PERF_TIMER_GUARD(write_wal_time);
         // LastAllocatedSequence is increased inside WriteToWAL under
@@ -565,6 +620,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
       PERF_TIMER_FOR_WAIT_GUARD(write_memtable_time);
 
       if (!parallel) {
+        /*这里由leader将整个writeGroup的合并结果插入mem*/
         // w.sequence will be set inside InsertInto
         w.status = WriteBatchInternal::InsertInto(
             write_group, current_sequence, column_family_memtables_.get(),
@@ -573,7 +629,9 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
             0 /*recovery_log_number*/, this, parallel, seq_per_batch_,
             batch_per_txn_);
       } else {
+        /*如果是parallel，则每个writebatch都做自己的写入，并发完成*/
         write_group.last_sequence = last_sequence;
+        /*这里面和猜测的一样，就是进去给每个follower修改状态为并发写*/
         write_thread_.LaunchParallelMemTableWriters(&write_group);
         in_parallel_group = true;
 
@@ -583,6 +641,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
           ColumnFamilyMemTablesImpl column_family_memtables(
               versions_->GetColumnFamilySet());
           assert(w.sequence == current_sequence);
+          /*这里是leader写它自己*/
           w.status = WriteBatchInternal::InsertInto(
               &w, w.sequence, &column_family_memtables, &flush_scheduler_,
               &trim_history_scheduler_,
@@ -670,6 +729,7 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   if (status.ok()) {
     status = w.FinalStatus();
   }
+  /*leader会一直写到这里*/
   return status;
 }
 
@@ -862,6 +922,7 @@ Status DBImpl::UnorderedWriteMemtable(const WriteOptions& write_options,
   PERF_TIMER_GUARD(write_pre_and_post_process_time);
   StopWatch write_sw(immutable_db_options_.clock, stats_, DB_WRITE);
 
+  /*又是构造writer，而且这次可以注意到，没有writethread了*/
   WriteThread::Writer w(write_options, my_batch, callback, log_ref,
                         false /*disable_memtable*/);
 
@@ -874,7 +935,7 @@ Status DBImpl::UnorderedWriteMemtable(const WriteOptions& write_options,
 
     PERF_TIMER_STOP(write_pre_and_post_process_time);
     PERF_TIMER_FOR_WAIT_GUARD(write_memtable_time);
-
+    /*取出全部column family， 这样writerbatch就有机会访问多个不同cf*/
     ColumnFamilyMemTablesImpl column_family_memtables(
         versions_->GetColumnFamilySet());
     w.status = WriteBatchInternal::InsertInto(
@@ -917,13 +978,18 @@ Status DBImpl::WriteImplWALOnly(
     PreReleaseCallback* pre_release_callback, const AssignOrder assign_order,
     const PublishLastSeq publish_last_seq, const bool disable_memtable) {
   PERF_TIMER_GUARD(write_pre_and_post_process_time);
+  /*熟悉的开始了，构造了一个Writer*/
   WriteThread::Writer w(write_options, my_batch, callback, log_ref,
                         disable_memtable, sub_batch_cnt, pre_release_callback);
   StopWatch write_sw(immutable_db_options_.clock, stats_, DB_WRITE);
 
+  /*这个workerthread自己有个链表头，这里是加进去，会试图加入队尾*/
+  /*如果成功加入为队尾，会进入等待，等待leader处理*/
   write_thread->JoinBatchGroup(&w);
   assert(w.state != WriteThread::STATE_PARALLEL_MEMTABLE_WRITER);
+  /*这个地方应该是不允许follower自己并发写入*/
   if (w.state == WriteThread::STATE_COMPLETED) {
+    /*follower会在joinBatchGroup里面wait到自己被完成（发生状态变更），然后再来这里直接走人*/
     if (log_used != nullptr) {
       *log_used = w.log_used;
     }
@@ -934,7 +1000,7 @@ Status DBImpl::WriteImplWALOnly(
   }
   // else we are the leader of the write batch group
   assert(w.state == WriteThread::STATE_GROUP_LEADER);
-
+  /*如果是leader，则需要去处理队列*/
   if (publish_last_seq == kDoPublishLastSeq) {
     Status status;
 
@@ -958,6 +1024,7 @@ Status DBImpl::WriteImplWALOnly(
       return status;
     }
   } else {
+    /*这里要publishhsequence才是常规流程*/
     PERF_TIMER_STOP(write_pre_and_post_process_time);
     PERF_TIMER_FOR_WAIT_GUARD(write_delay_time);
     InstrumentedMutexLock lock(&mutex_);
@@ -973,8 +1040,13 @@ Status DBImpl::WriteImplWALOnly(
     }
   }
 
+  /*注意这里直接构造了一个全新的group*/
   WriteThread::WriteGroup write_group;
   uint64_t last_sequence;
+  /*  这里面进去就是处理batch队列了，
+   * 会将链表中不能合并的writers重排序，放到尾巴上去，然后能合并的节点会从连表头开始是连续的，并且被writer_group用last_writer和leader分别指向尾和头
+   * 可以说这个函数主要就是把write_group构造好了
+   * */
   write_thread->EnterAsBatchGroupLeader(&w, &write_group);
   // Note: no need to update last_batch_group_size_ here since the batch writes
   // to WAL only
@@ -992,9 +1064,11 @@ Status DBImpl::WriteImplWALOnly(
 
   size_t pre_release_callback_cnt = 0;
   size_t total_byte_size = 0;
+  /*这个循环似乎只做了size的叠加*/
   for (auto* writer : write_group) {
     assert(writer);
-    if (writer->CheckCallback(this)) {
+    if (writer->CheckCallback(
+            this)) { /*用户给的回调，如果返回false这个write就abort*/
       total_byte_size = WriteBatchInternal::AppendedByteSize(
           total_byte_size, WriteBatchInternal::ByteSize(writer->batch));
       if (writer->pre_release_callback) {
@@ -1029,7 +1103,9 @@ Status DBImpl::WriteImplWALOnly(
   // LastAllocatedSequence is increased inside WriteToWAL under
   // wal_write_mutex_ to ensure ordered events in WAL
   size_t seq_inc = 0 /* total_count */;
-  if (assign_order == kDoAssignOrder) {
+  if (assign_order ==
+      kDoAssignOrder) { /*如果要求ordered
+                           writer，就会进入这个分支，会计算seq增加了多少*/
     size_t total_batch_cnt = 0;
     for (auto* writer : write_group) {
       assert(writer->batch_cnt || !seq_per_batch_);
@@ -1039,8 +1115,10 @@ Status DBImpl::WriteImplWALOnly(
     }
     seq_inc = total_batch_cnt;
   }
+
   Status status;
   if (!write_options.disableWAL) {
+    /*这里就是真正的IO行为了，把write_group并发写下去wal*/
     IOStatus io_s =
         ConcurrentWriteToWAL(write_group, log_used, &last_sequence, seq_inc);
     status = io_s;
@@ -1053,12 +1131,14 @@ Status DBImpl::WriteImplWALOnly(
       return status;
     }
   } else {
+    /*如果关闭了wal，就不只增加seq*/
     // Otherwise we inc seq number to do solely the seq allocation
     last_sequence = versions_->FetchAddLastAllocatedSequence(seq_inc);
   }
 
   size_t memtable_write_cnt = 0;
   auto curr_seq = last_sequence + 1;
+  /*这个循环似乎增加了一下本地的seq和memtable write count*/
   for (auto* writer : write_group) {
     if (writer->CallbackFailed()) {
       continue;
@@ -1077,6 +1157,7 @@ Status DBImpl::WriteImplWALOnly(
     assert(!write_options.disableWAL);
     // Requesting sync with two_write_queues_ is expected to be very rare. We
     // hance provide a simple implementation that is not necessarily efficient.
+    /*开启了sync的话就直接刷*/
     if (manual_wal_flush_) {
       status = FlushWAL(true);
     } else {
@@ -1092,6 +1173,7 @@ Status DBImpl::WriteImplWALOnly(
     size_t index = 0;
     for (auto* writer : write_group) {
       if (!writer->CallbackFailed() && writer->pre_release_callback) {
+        /*如果有pre_release_callback，就调用*/
         assert(writer->sequence != kMaxSequenceNumber);
         Status ws = writer->pre_release_callback->Callback(
             writer->sequence, disable_memtable, writer->log_used, index++,
@@ -1103,12 +1185,14 @@ Status DBImpl::WriteImplWALOnly(
       }
     }
   }
+  /*就算是unordered_write也需要发布lastseq的*/
   if (publish_last_seq == kDoPublishLastSeq) {
     versions_->SetLastSequence(last_sequence + seq_inc);
     // Currently we only use kDoPublishLastSeq in unordered_write
     assert(immutable_db_options_.unordered_write);
   }
   if (immutable_db_options_.unordered_write && status.ok()) {
+    /*这个是leveldb里面没有的东西，就是pending 的memtable writes数量*/
     pending_memtable_writes_ += memtable_write_cnt;
   }
   write_thread->ExitAsBatchGroupLeader(write_group, status);
@@ -1181,6 +1265,7 @@ void DBImpl::MemTableInsertStatusCheck(const Status& status) {
 Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
                                LogContext* log_context,
                                WriteContext* write_context) {
+  /*这个函数几乎等同于leveldb里的MakeRoomForWrite*/
   assert(write_context != nullptr && log_context != nullptr);
   Status status;
 
@@ -1192,6 +1277,7 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
   PERF_TIMER_GUARD(write_scheduling_flushes_compactions_time);
 
   if (UNLIKELY(status.ok() && total_log_size_ > GetMaxTotalWalSize())) {
+    /*如果size到了，切换wal*/
     assert(versions_);
     InstrumentedMutexLock l(&mutex_);
     const ColumnFamilySet* const column_families =
@@ -1306,6 +1392,7 @@ Status DBImpl::MergeBatch(const WriteThread::WriteGroup& write_group,
     // we simply write the first WriteBatch to WAL if the group only
     // contains one batch, that batch should be written to the WAL,
     // and the batch is not wanting to be truncated
+    /*如果整个writer_group里面就一个batch，直接让merge_batch等于过去就行*/
     *merged_batch = leader->batch;
     if (WriteBatchInternal::IsLatestPersistentState(*merged_batch)) {
       *to_be_cached_state = *merged_batch;
@@ -1316,6 +1403,7 @@ Status DBImpl::MergeBatch(const WriteThread::WriteGroup& write_group,
     // We could avoid copying here with an iov-like AddRecord
     // interface
     *merged_batch = tmp_batch;
+    /*这个循环不出所料，把batch全部拼接到了一起，存储在了tmp_batch里面*/
     for (auto writer : write_group) {
       if (!writer->CallbackFailed()) {
         Status s = WriteBatchInternal::Append(*merged_batch, writer->batch,
@@ -1345,6 +1433,7 @@ IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
                             LogFileNumberSize& log_file_number_size) {
   assert(log_size != nullptr);
 
+  /*多个writebatch，多个write操作，整个被打成了一条log_entry,看了一下，直接就是把rep搞过去了*/
   Slice log_entry = WriteBatchInternal::Contents(&merged_batch);
   TEST_SYNC_POINT_CALLBACK("DBImpl::WriteToWAL:log_entry", &log_entry);
   auto s = merged_batch.VerifyChecksum();
@@ -1396,11 +1485,13 @@ IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
   WriteBatch* merged_batch;
   io_s = status_to_io_status(MergeBatch(write_group, &tmp_batch_, &merged_batch,
                                         &write_with_wal, &to_be_cached_state));
+  /*这里把writeGroup的batch都合并了*/
   if (UNLIKELY(!io_s.ok())) {
     return io_s;
   }
 
   if (merged_batch == write_group.leader->batch) {
+    /*group内部就一个batch*/
     write_group.leader->log_used = logfile_number_;
   } else if (write_with_wal > 1) {
     for (auto writer : write_group) {
@@ -1416,6 +1507,7 @@ IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
   WriteOptions write_options;
   write_options.rate_limiter_priority =
       write_group.leader->rate_limiter_priority;
+  /*没啥特别的，就是写*/
   io_s = WriteToWAL(*merged_batch, write_options, log_writer, log_used,
                     &log_size, log_file_number_size);
   if (to_be_cached_state) {
@@ -1492,15 +1584,18 @@ IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
 IOStatus DBImpl::ConcurrentWriteToWAL(
     const WriteThread::WriteGroup& write_group, uint64_t* log_used,
     SequenceNumber* last_sequence, size_t seq_inc) {
+  /* 有一点没搞清楚的就是concurrent在哪里，现在猜测还是用户线程咯*/
   IOStatus io_s;
 
+  /*现在我猜想two_write_queues_是一个给memtable，一个给wal*/
   assert(two_write_queues_ || immutable_db_options_.unordered_write);
   assert(!write_group.leader->disable_wal);
   // Same holds for all in the batch group
-  WriteBatch tmp_batch;
+  WriteBatch tmp_batch; /*同WriteToWAL的区别1：这个tmp_batch开在栈上，而不是属于DBImpl成员*/
   size_t write_with_wal = 0;
   WriteBatch* to_be_cached_state = nullptr;
   WriteBatch* merged_batch;
+  /*这里把write_group中的batch全部拼接起来了合并为1个，存储在tmp_batch里面，由merged_batch指向*/
   io_s = status_to_io_status(MergeBatch(write_group, &tmp_batch, &merged_batch,
                                         &write_with_wal, &to_be_cached_state));
   if (UNLIKELY(!io_s.ok())) {
@@ -1509,16 +1604,20 @@ IOStatus DBImpl::ConcurrentWriteToWAL(
 
   // We need to lock log_write_mutex_ since logs_ and alive_log_files might be
   // pushed back concurrently
+  /*同WriteToWAL的区别2：锁了log_write_mutex*/
   log_write_mutex_.Lock();
-  if (merged_batch == write_group.leader->batch) {
+  if (merged_batch ==
+      write_group.leader->batch) { /*如果write_group里面刚好只有一个writebatch*/
     write_group.leader->log_used = logfile_number_;
   } else if (write_with_wal > 1) {
     for (auto writer : write_group) {
       writer->log_used = logfile_number_;
     }
   }
+  /*增加seqnum咯，顺带会取回之前最新的seqnum*/
   *last_sequence = versions_->FetchAddLastAllocatedSequence(seq_inc);
   auto sequence = *last_sequence + 1;
+  /*直到这一步才真的setseqnum*/
   WriteBatchInternal::SetSequence(merged_batch, sequence);
 
   log::Writer* log_writer = logs_.back().writer;
@@ -1532,6 +1631,7 @@ IOStatus DBImpl::ConcurrentWriteToWAL(
   WriteOptions write_options;
   write_options.rate_limiter_priority =
       write_group.leader->rate_limiter_priority;
+  /*这里做了真正的刷盘操作*/
   io_s = WriteToWAL(*merged_batch, write_options, log_writer, log_used,
                     &log_size, log_file_number_size);
   if (to_be_cached_state) {

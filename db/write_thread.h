@@ -129,7 +129,7 @@ class WriteThread {
     WriteCallback* callback;
     bool made_waitable;          // records lazy construction of mutex and cv
     std::atomic<uint8_t> state;  // write under StateMutex() or pre-link
-    WriteGroup* write_group;
+    WriteGroup* write_group; /*该writer所属于的writegroup*/
     SequenceNumber sequence;  // the sequence number to use for the first key
     Status status;
     Status callback_status;  // status returned by callback->Callback()

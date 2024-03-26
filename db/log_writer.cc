@@ -160,7 +160,7 @@ IOStatus Writer::AddRecord(const WriteOptions& write_options,
       } else {
         type = recycle_log_files_ ? kRecyclableMiddleType : kMiddleType;
       }
-
+      /*这看到了，其实wal就是合并以后的writerbatch整个写进去，追加的内容就是rep_*/
       s = EmitPhysicalRecord(write_options, type, ptr, fragment_length);
       ptr += fragment_length;
       left -= fragment_length;

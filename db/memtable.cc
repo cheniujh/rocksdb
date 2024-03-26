@@ -728,6 +728,7 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
   //  value_size   : varint32 of value.size()
   //  value bytes  : char[value.size()]
   //  checksum     : char[moptions_.protection_bytes_per_key]
+  /*cf_id不用嵌入进去吗？*/
   uint32_t key_size = static_cast<uint32_t>(key.size());
   uint32_t val_size = static_cast<uint32_t>(value.size());
   uint32_t internal_key_size = key_size + 8;
@@ -745,12 +746,15 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
   p += key_size;
   uint64_t packed = PackSequenceAndType(s, type);
   EncodeFixed64(p, packed);
+  /*这里在key后面追加了seqnum和type，下面就把valuesize和value追加进去了*/
   p += 8;
   p = EncodeVarint32(p, val_size);
   memcpy(p, value.data(), val_size);
   assert((unsigned)(p + val_size - buf + moptions_.protection_bytes_per_key) ==
          (unsigned)encoded_len);
 
+
+  /*每个entry都有checksum*/
   UpdateEntryChecksum(kv_prot_info, key, value, type, s,
                       buf + encoded_len - moptions_.protection_bytes_per_key);
   Slice encoded(buf, encoded_len - moptions_.protection_bytes_per_key);
@@ -774,6 +778,7 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
         return Status::TryAgain("key+seq exists");
       }
     } else {
+      /*这里是允许并发的分支，目前还有一个问题，就是没见到cf id,后面把读写，compaction全部看完，应该会有点数*/
       bool res = table->InsertKey(handle);
       if (UNLIKELY(!res)) {
         return Status::TryAgain("key+seq exists");
